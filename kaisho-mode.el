@@ -196,12 +196,9 @@ Excludes contracts with billable=false or invoiced=true."
 ;;; Clock operations via CLI
 ;;; ---------------------------------------------------------------
 
-(defun kaisho--fmt-h (hours)
-  "Format HOURS (float) as a human-readable string like 2h05m."
-  (let* ((total-mins (round (* hours 60)))
-         (h (/ total-mins 60))
-         (m (% total-mins 60)))
-    (format "%dh%02dm" h m)))
+(defun kaisho--fmt-mins (minutes)
+  "Format MINUTES (integer) as a string like 2h05m."
+  (format "%dh%02dm" (/ minutes 60) (% minutes 60)))
 
 (defun kaisho-clock-toggle ()
   "Toggle the clock on a Kaisho task via the kai CLI.
@@ -250,23 +247,24 @@ and task description, then run `kai clock start'."
          (entries (kaisho--call-json-safe
                    "clock" "list"
                    "--from" today "--to" today "--json"))
-         (totals (make-hash-table :test 'equal))
-         (total-h 0.0))
+         (totals (make-hash-table :test 'equal)))
     (dolist (e (or entries '()))
       (let* ((cust (or (alist-get 'customer e) "?"))
-             (h (or (alist-get 'hours e) 0.0)))
-        (puthash cust (+ (gethash cust totals 0.0) h) totals)))
+             (mins (or (alist-get 'duration_minutes e) 0)))
+        (puthash cust (+ (gethash cust totals 0) mins) totals)))
     (if (hash-table-empty-p totals)
         (message "No time clocked today")
-      (maphash (lambda (_ h) (setq total-h (+ total-h h))) totals)
-      (let (pairs)
-        (maphash (lambda (k v) (push (cons k v) pairs)) totals)
+      (let (pairs (total-mins 0))
+        (maphash (lambda (k v)
+                   (push (cons k v) pairs)
+                   (setq total-mins (+ total-mins v)))
+                 totals)
         (message "Today: %s  |  %s"
-                 (kaisho--fmt-h total-h)
+                 (kaisho--fmt-mins total-mins)
                  (mapconcat
                   (lambda (p)
                     (format "%s %s" (car p)
-                            (kaisho--fmt-h (cdr p))))
+                            (kaisho--fmt-mins (cdr p))))
                   (nreverse pairs) "  "))))))
 
 (defun kaisho-clock-goto ()
