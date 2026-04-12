@@ -407,6 +407,24 @@ Customer list is read from the kai CLI."
 ;;; kai CLI runner (interactive)
 ;;; ---------------------------------------------------------------
 
+(defun kaisho-debug ()
+  "Show diagnostic output to help troubleshoot kaisho-mode.
+Runs `kai customer list --json' and displays the raw result."
+  (interactive)
+  (let ((buf (get-buffer-create "*kaisho-debug*")))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert (format "kaisho-cli-executable: %s\n" kaisho-cli-executable))
+      (insert (format "kaisho-org-dir: %s\n\n" kaisho-org-dir))
+      (insert "--- kai customer list --json ---\n")
+      (let* ((shell (or (getenv "SHELL") "/bin/bash"))
+             (cmd (mapconcat #'shell-quote-argument
+                             (list kaisho-cli-executable
+                                   "customer" "list" "--json") " "))
+             (exit-code (call-process shell nil t nil "-l" "-c" cmd)))
+        (insert (format "\n--- exit code: %d ---\n" exit-code))))
+    (pop-to-buffer buf)))
+
 (defun kaisho-run-command (args)
   "Run the kai CLI with ARGS (a string) in a compilation buffer."
   (compile (concat kaisho-cli-executable " " args)))
