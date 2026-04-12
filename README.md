@@ -119,32 +119,54 @@ under the `C-c k` prefix:
 
 ## Doom Emacs
 
-With Doom, bind commands under a `SPC n k` prefix:
+Use `load` instead of `use-package!` so that `SPC h r r` picks up
+changes to the package immediately without a full Emacs restart:
 
 ```elisp
-(use-package! kaisho-mode
-  :load-path "~/develop/kaisho-mode"
-  :config
-  (setq kaisho-cli-executable
-        (expand-file-name "~/.pyenv/shims/kai"))
-  (setq kaisho-org-dir "~/ownCloud/cowork/org/")
-  (kaisho-configure-org)
-  (kaisho-mode +1))
+;; Always reload from disk on config reload (SPC h r r).
+;; use-package! would skip re-evaluation once the feature is loaded.
+(load (expand-file-name "~/develop/kaisho-mode/kaisho-mode.el") nil t)
+(setq kaisho-org-dir
+      (expand-file-name "~/ownCloud/cowork/org/"))
+(setq kaisho-cli-executable
+      (expand-file-name "~/.pyenv/versions/3.12.12/bin/kai"))
+(kaisho-configure-org)
+(kaisho-mode +1)
 
+;; SPC n k -- Kaisho workflow
 (map! :leader
       (:prefix ("n k" . "kaisho")
        ;; Files
-       :desc "TODOs"          "t" #'kaisho-open-todos
-       :desc "Clocks"         "c" #'kaisho-open-clocks
-       :desc "Notes"          "n" #'kaisho-open-notes
+       :desc "TODOs"           "t" #'kaisho-open-todos
+       :desc "Clocks"          "c" #'kaisho-open-clocks
+       :desc "Notes"           "n" #'kaisho-open-notes
        ;; Clock
-       :desc "Clock toggle"   "k" #'kaisho-clock-toggle
-       :desc "Clock summary"  "s" #'kaisho-clock-today-summary
-       :desc "Clock goto"     "g" #'kaisho-clock-goto
-       :desc "Clock insert"   "i" #'kaisho-insert-clock-entry
-       :desc "Clock report"   "r" #'kaisho-clock-report
+       :desc "Clock toggle"    "k" #'kaisho-clock-toggle
+       :desc "Clock summary"   "s" #'kaisho-clock-today-summary
+       :desc "Clock goto"      "g" #'kaisho-clock-goto
+       :desc "Clock insert"    "i" #'kaisho-insert-clock-entry
+       :desc "Clock report"    "r" #'kaisho-clock-report
        ;; CLI
        :desc "Run kai command" "!" #'kaisho-run-command-interactive))
+
+;; Optional: accessible from any buffer
+(map! :g "<f5>" #'kaisho-clock-toggle)
+```
+
+### pyenv note
+
+If `kai` is installed under a specific pyenv Python version, point
+`kaisho-cli-executable` at the direct binary rather than the pyenv
+shim.  Emacs launched as a GUI app does not run through the login
+shell, so pyenv shims cannot resolve which Python to use:
+
+```elisp
+;; Wrong: shim fails without shell environment
+;; (setq kaisho-cli-executable "~/.pyenv/shims/kai")
+
+;; Correct: direct path to the Python version that has kai installed
+(setq kaisho-cli-executable
+      (expand-file-name "~/.pyenv/versions/3.12.12/bin/kai"))
 ```
 
 ## Org file format
