@@ -4,7 +4,7 @@
 
 ;; Author: Ramon Bartl <rb@ridingbytes.com>
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "27.1") (org "9.5") (websocket "1.12"))
+;; Package-Requires: ((emacs "27.1") (org "9.5") (websocket "1.12") (cl-lib "0.5"))
 ;; Keywords: tools, org, productivity, time-tracking
 ;; URL: https://github.com/ridingbytes/kaisho-mode
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -33,6 +33,7 @@
 
 ;;; Code:
 
+(require 'cl-lib)
 (require 'org)
 (require 'json)
 (require 'url)
@@ -155,6 +156,10 @@ Cache entries expire after `kaisho-cache-ttl' seconds."
 (defvar kaisho--active-clock nil
   "Plist for the running clock as returned by /api/clocks/active,
 or nil when no clock is active.")
+
+(defvar kaisho--last-clock nil
+  "Plist of the most recently stopped clock.
+Saved on stop so the user can resume it on the next toggle.")
 
 (defvar kaisho--mode-line-string ""
   "Mode-line segment updated by `kaisho--update-mode-line'.")
@@ -385,12 +390,45 @@ and task description, then run `kai clock start'."
   (if (kaisho--clock-active-p)
       (progn
         (kaisho--call "clock" "stop")
+        (setq kaisho--last-clock kaisho--active-clock)
         (kaisho--clear-clock)
         (message "Clock stopped"))
     (kaisho--clock-start-new)))
 
+(defun kaisho--clock-resume ()
+  "Resume `kaisho--last-clock' without prompting.
+Returns non-nil on success."
+  (let* ((customer (or (plist-get kaisho--last-clock :customer) ""))
+         (desc     (or (plist-get kaisho--last-clock :description) ""))
+         (contract (plist-get kaisho--last-clock :contract))
+         (result   (kaisho--call-json-safe
+                    "clock" "start" customer desc "--json")))
+    (when (and contract result)
+      (let ((start-iso (alist-get 'start result)))
+        (when start-iso
+          (kaisho--call-json-safe
+           "clock" "update" start-iso "--contract" contract))))
+    (when result
+      (kaisho--set-clock
+       (list :customer customer
+             :description desc
+             :start (alist-get 'start result))))
+    (when result
+      (message "Clock resumed: [%s]%s %s"
+               customer
+               (if contract (format " (%s)" contract) "")
+               desc))
+    result))
+
 (defun kaisho--clock-start-new ()
   "Prompt for customer, contract and task, then call kai clock start."
+  (when (and kaisho--last-clock
+             (y-or-n-p
+              (format "Resume [%s - %s]? "
+                      (or (plist-get kaisho--last-clock :customer) "")
+                      (or (plist-get kaisho--last-clock :description) ""))))
+    (kaisho--clock-resume)
+    (cl-return-from kaisho--clock-start-new))
   (let* ((customer (completing-read
                     "Customer: " (kaisho-customers) nil nil))
          (customer (if (string-empty-p customer) "Misc" customer))
