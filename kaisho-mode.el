@@ -26,12 +26,15 @@
 ;;   - Capture templates wired to Kaisho org files
 ;;   - Run kai CLI commands from within Emacs
 ;;
-;; Quickstart:
+;; Quickstart (straight.el):
 ;;
 ;;   (use-package kaisho-mode
-;;     :load-path "/path/to/kaisho-mode"
+;;     :straight (:host github :repo "ridingbytes/kaisho-mode")
 ;;     :config
 ;;     (setq kaisho-org-dir "~/your/org/dir/")
+;;     ;; Optional: point to the kai executable inside a venv
+;;     ;; (setq kaisho-cli-executable
+;;     ;;       (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
 ;;     (kaisho-configure-org)
 ;;     (kaisho-mode +1))
 ;;

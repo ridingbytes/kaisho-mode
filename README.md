@@ -26,26 +26,6 @@ files, using `org-clock` for time tracking rather than reimplementing it.
 
 ## Installation
 
-### Manual
-
-Clone this repository and add the directory to your `load-path`:
-
-```elisp
-(add-to-list 'load-path "/path/to/kaisho-mode")
-(require 'kaisho-mode)
-```
-
-### use-package
-
-```elisp
-(use-package kaisho-mode
-  :load-path "/path/to/kaisho-mode"
-  :config
-  (setq kaisho-org-dir "~/ownCloud/cowork/org/")
-  (kaisho-configure-org)
-  (kaisho-mode +1))
-```
-
 ### straight.el
 
 ```elisp
@@ -55,6 +35,26 @@ Clone this repository and add the directory to your `load-path`:
   (setq kaisho-org-dir "~/ownCloud/cowork/org/")
   (kaisho-configure-org)
   (kaisho-mode +1))
+```
+
+### elpaca
+
+```elisp
+(use-package kaisho-mode
+  :elpaca (:host github :repo "ridingbytes/kaisho-mode")
+  :config
+  (setq kaisho-org-dir "~/ownCloud/cowork/org/")
+  (kaisho-configure-org)
+  (kaisho-mode +1))
+```
+
+### Manual
+
+Clone this repository and add the directory to your `load-path`:
+
+```elisp
+(add-to-list 'load-path "/path/to/kaisho-mode")
+(require 'kaisho-mode)
 ```
 
 ## Configuration
@@ -90,10 +90,13 @@ to your personal config.
 
 ### CLI executable
 
-If `kai` is not on your `exec-path`, set the full path:
+If `kai` is not on your `exec-path`, set the full path.  When running
+Kaisho from a local checkout with a virtualenv, point directly to the
+executable inside `.venv`:
 
 ```elisp
-(setq kaisho-cli-executable "/home/you/.local/bin/kai")
+(setq kaisho-cli-executable
+      (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
 ```
 
 ## Default keybindings
@@ -101,18 +104,18 @@ If `kai` is not on your `exec-path`, set the full path:
 When `kaisho-mode` is enabled, the following bindings are active globally
 under the `C-c k` prefix:
 
-| Key       | Command                          | Description                     |
-|-----------|----------------------------------|---------------------------------|
-| `C-c k t` | `kaisho-clock-toggle`            | Start or stop the clock         |
-| `C-c k s` | `kaisho-clock-today-summary`     | Show today's clocked time       |
-| `C-c k g` | `kaisho-clock-goto`              | Jump to current/last clock      |
-| `C-c k i` | `kaisho-insert-clock-entry`      | Insert a backdated clock entry  |
-| `C-c k r` | `kaisho-clock-report`            | Insert/update clock table       |
-| `C-c k x` | `org-clock-cancel`               | Cancel the running clock        |
-| `C-c k f t` | `kaisho-open-todos`            | Open todos.org                  |
-| `C-c k f c` | `kaisho-open-clocks`           | Open clocks.org                 |
-| `C-c k f n` | `kaisho-open-notes`            | Open notes.org                  |
-| `C-c k !` | `kaisho-run-command-interactive` | Run a kai CLI command           |
+| Key         | Command                          | Description                    |
+|-------------|----------------------------------|--------------------------------|
+| `C-c k t`   | `kaisho-clock-toggle`            | Start or stop the clock        |
+| `C-c k s`   | `kaisho-clock-today-summary`     | Show today's clocked time      |
+| `C-c k g`   | `kaisho-clock-goto`              | Jump to current/last clock     |
+| `C-c k i`   | `kaisho-insert-clock-entry`      | Insert a backdated clock entry |
+| `C-c k r`   | `kaisho-clock-report`            | Insert/update clock table      |
+| `C-c k x`   | `org-clock-cancel`               | Cancel the running clock       |
+| `C-c k f t` | `kaisho-open-todos`              | Open todos.org                 |
+| `C-c k f c` | `kaisho-open-clocks`             | Open clocks.org                |
+| `C-c k f n` | `kaisho-open-notes`              | Open notes.org                 |
+| `C-c k !`   | `kaisho-run-command-interactive` | Run a kai CLI command          |
 
 ## Doom Emacs
 
@@ -120,7 +123,7 @@ With Doom, bind commands under a `SPC n k` prefix instead:
 
 ```elisp
 (use-package! kaisho-mode
-  :load-path "/path/to/kaisho-mode"
+  :straight (:host github :repo "ridingbytes/kaisho-mode")
   :config
   (setq kaisho-org-dir "~/ownCloud/cowork/org/")
   (kaisho-configure-org)
