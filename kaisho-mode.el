@@ -124,13 +124,10 @@ Cache entries expire after `kaisho-cache-ttl' seconds."
 
 (defun kaisho--call (&rest args)
   "Run kai CLI with ARGS and return stdout as a string.
-Uses the login shell so pyenv and PATH are initialised correctly.
 Signals an error when the process exits non-zero."
   (with-temp-buffer
-    (let* ((cmd (mapconcat #'shell-quote-argument
-                           (cons kaisho-cli-executable args) " "))
-           (shell (or (getenv "SHELL") "/bin/bash"))
-           (exit-code (call-process shell nil t nil "-l" "-c" cmd)))
+    (let ((exit-code (apply #'call-process
+                            kaisho-cli-executable nil t nil args)))
       (unless (zerop exit-code)
         (error "kai %s failed: %s"
                (mapconcat #'identity args " ")
@@ -417,11 +414,8 @@ Runs `kai customer list --json' and displays the raw result."
       (insert (format "kaisho-cli-executable: %s\n" kaisho-cli-executable))
       (insert (format "kaisho-org-dir: %s\n\n" kaisho-org-dir))
       (insert "--- kai customer list --json ---\n")
-      (let* ((shell (or (getenv "SHELL") "/bin/bash"))
-             (cmd (mapconcat #'shell-quote-argument
-                             (list kaisho-cli-executable
-                                   "customer" "list" "--json") " "))
-             (exit-code (call-process shell nil t nil "-l" "-c" cmd)))
+      (let* ((exit-code (call-process kaisho-cli-executable nil t nil
+                                      "customer" "list" "--json")))
         (insert (format "\n--- exit code: %d ---\n" exit-code))))
     (pop-to-buffer buf)))
 
