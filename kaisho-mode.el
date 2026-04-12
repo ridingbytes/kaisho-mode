@@ -400,7 +400,7 @@ and task description, then run `kai clock start'."
          (result (kaisho--call-json-safe
                   "clock" "start" customer task "--json")))
     (when (and contract result)
-      (let ((start-iso (alist-get 'started_at result)))
+      (let ((start-iso (alist-get 'start result)))
         (when start-iso
           (kaisho--call-json-safe
            "clock" "update" start-iso "--contract" contract))))
@@ -408,7 +408,7 @@ and task description, then run `kai clock start'."
       (kaisho--set-clock
        (list :customer customer
              :description task
-             :start (alist-get 'started_at result))))
+             :start (alist-get 'start result))))
     (message "Clock started: [%s]%s %s"
              customer
              (if contract (format " (%s)" contract) "")
