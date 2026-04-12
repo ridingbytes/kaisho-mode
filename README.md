@@ -17,12 +17,13 @@ files, using `org-clock` for time tracking rather than reimplementing it.
 - Navigate to the current or last clocked task
 - Open Kaisho org files directly
 - Run `kai` CLI commands from Emacs
+- Optional API sync: detect clocks stopped from the web app
 
 ## Requirements
 
 - Emacs 27.1 or later
 - Org-mode 9.5 or later
-- A running Kaisho installation (for the `kai` CLI commands)
+- A Kaisho installation with org files (the `kai` server is optional)
 
 ## Installation
 
@@ -99,6 +100,23 @@ executable inside `.venv`:
       (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
 ```
 
+### API sync (optional)
+
+By default kaisho-mode tracks clock state locally via `org-clock`.  If
+you also run the kai server and want `kaisho-clock-toggle` to detect
+clocks stopped from the web app, enable API sync:
+
+```elisp
+(setq kaisho-api-sync t)
+;; Default URL is http://localhost:8765 -- change if needed:
+;; (setq kaisho-api-url "http://localhost:8765")
+```
+
+When enabled, `kaisho-clock-toggle` queries `GET /api/clocks/active`
+before deciding whether to stop or start.  If the server is unreachable
+it falls back silently to local org-clock state, so toggling still works
+without the server running.
+
 ## Default keybindings
 
 When `kaisho-mode` is enabled, the following bindings are active globally
@@ -126,6 +144,7 @@ With Doom, bind commands under a `SPC n k` prefix instead:
   :straight (:host github :repo "ridingbytes/kaisho-mode")
   :config
   (setq kaisho-org-dir "~/ownCloud/cowork/org/")
+  (setq kaisho-api-sync t)
   (kaisho-configure-org)
   (kaisho-mode +1))
 
@@ -143,8 +162,7 @@ With Doom, bind commands under a `SPC n k` prefix instead:
        :desc "Clock report"   "r" #'kaisho-clock-report
        :desc "Clock cancel"   "x" #'org-clock-cancel
        ;; CLI
-       :desc "Run kai command" "!" #'kaisho-run-command-interactive
-       :desc "kai serve"       "S" #'kaisho-serve))
+       :desc "Run kai command" "!" #'kaisho-run-command-interactive))
 ```
 
 ## Org file format
@@ -167,15 +185,19 @@ Customer headings in `customers.org` follow this structure:
 ** Customer Name
 *** CONTRACT Contract A
     :PROPERTIES:
-    :BOOKABLE: true
     :END:
 *** CONTRACT Internal
     :PROPERTIES:
-    :BOOKABLE: false
+    :BILLABLE: false
+    :END:
+*** CONTRACT Finished Work
+    :PROPERTIES:
+    :INVOICED: true
     :END:
 ```
 
-Contracts with `:BOOKABLE: false` are excluded from completion.
+Contracts with `:BILLABLE: false` or `:INVOICED: true` are excluded
+from completion in `kaisho-clock-toggle` and `kaisho-insert-clock-entry`.
 
 ## License
 

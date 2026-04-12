@@ -1,6 +1,6 @@
 ;;; kaisho-mode.el --- Emacs integration for Kaisho -*- lexical-binding: t -*-
 
-;; Copyright (C) 2024 Ramon Bartl
+;; Copyright (C) 2026 Ramon Bartl
 
 ;; Author: Ramon Bartl <rb@ridingbytes.com>
 ;; Version: 0.1.0
@@ -25,6 +25,7 @@
 ;;   - Customer and contract completion from customers.org
 ;;   - Capture templates wired to Kaisho org files
 ;;   - Run kai CLI commands from within Emacs
+;;   - Optional API sync: detect clocks stopped from the web app
 ;;
 ;; Quickstart (straight.el):
 ;;
@@ -32,9 +33,8 @@
 ;;     :straight (:host github :repo "ridingbytes/kaisho-mode")
 ;;     :config
 ;;     (setq kaisho-org-dir "~/your/org/dir/")
-;;     ;; Optional: point to the kai executable inside a venv
-;;     ;; (setq kaisho-cli-executable
-;;     ;;       (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
+;;     ;; Optional: enable API sync when the kai server is running
+;;     ;; (setq kaisho-api-sync t)
 ;;     (kaisho-configure-org)
 ;;     (kaisho-mode +1))
 ;;
@@ -70,6 +70,19 @@ This must match the org directory configured in the Kaisho app."
 (defcustom kaisho-clock-buffer-name "*Kaisho Clock*"
   "Buffer name used for kai CLI output."
   :type 'string
+  :group 'kaisho)
+
+(defcustom kaisho-api-url "http://localhost:8765"
+  "Base URL of the running Kaisho backend.
+Used only when `kaisho-api-sync' is non-nil."
+  :type 'string
+  :group 'kaisho)
+
+(defcustom kaisho-api-sync nil
+  "When non-nil, verify clock state against the Kaisho API on toggle.
+Requires the kai server to be running at `kaisho-api-url'.
+When the server is unreachable, falls back to local org-clock state."
+  :type 'boolean
   :group 'kaisho)
 
 
@@ -120,8 +133,8 @@ This must match the org directory configured in the Kaisho app."
     (delete-dups (nreverse customers))))
 
 (defun kaisho-customer-contracts (customer)
-  "Return bookable contract names for CUSTOMER from customers.org.
-Contracts with a :BOOKABLE: false property are excluded."
+  "Return available contract names for CUSTOMER from customers.org.
+Contracts with :BILLABLE: false or :INVOICED: true are excluded."
   (when (file-exists-p (kaisho-customers-file))
     (with-temp-buffer
       (insert-file-contents (kaisho-customers-file))
@@ -148,10 +161,15 @@ Contracts with a :BOOKABLE: false property are excluded."
                              section-end t)
                             (point)
                           section-end))))
-                (unless (save-excursion
-                          (re-search-forward
-                           "^\\s-*:BOOKABLE:\\s-*false"
-                           props-end t))
+                (unless (or
+                         (save-excursion
+                           (re-search-forward
+                            "^\\s-*:BILLABLE:\\s-*false"
+                            props-end t))
+                         (save-excursion
+                           (re-search-forward
+                            "^\\s-*:INVOICED:\\s-*true"
+                            props-end t)))
                   (push name contracts))))))
         (nreverse contracts)))))
 
@@ -218,6 +236,47 @@ Creates the drawer when absent."
 
 
 ;;; ---------------------------------------------------------------
+;;; API sync helpers
+;;; ---------------------------------------------------------------
+
+(defun kaisho--api-active-clock ()
+  "Query the Kaisho API for the active clock.
+Returns t when a clock is running, nil when idle, and
+\\='unreachable when the server cannot be contacted."
+  (condition-case _err
+      (let* ((url (concat (string-trim-right kaisho-api-url "/")
+                          "/api/clocks/active"))
+             (url-request-method "GET")
+             (response-buf (url-retrieve-synchronously url t t 2)))
+        (if (null response-buf)
+            'unreachable
+          (with-current-buffer response-buf
+            (goto-char (point-min))
+            (re-search-forward "\r?\n\r?\n" nil t)
+            (let* ((body (buffer-substring (point) (point-max)))
+                   (data (json-read-from-string body))
+                   (active (cdr (assq 'active data))))
+              (kill-buffer response-buf)
+              (if active t nil)))))
+    (error 'unreachable)))
+
+(defun kaisho--clock-running-p ()
+  "Return non-nil when a clock is considered running.
+When `kaisho-api-sync' is non-nil, asks the Kaisho API.
+Falls back to `org-clocking-p' when the server is unreachable
+or `kaisho-api-sync' is nil."
+  (if kaisho-api-sync
+      (let ((result (kaisho--api-active-clock)))
+        (cond
+         ((eq result 'unreachable)
+          (message "Kaisho: server unreachable, \
+using local clock state")
+          (org-clocking-p))
+         (t result)))
+    (org-clocking-p)))
+
+
+;;; ---------------------------------------------------------------
 ;;; Clock in/out
 ;;; ---------------------------------------------------------------
 
@@ -234,12 +293,18 @@ Creates the drawer when absent."
 
 When a clock is running: stop it (cancel if the marker is stale).
 When no clock is running: offer to resume the last task or prompt
-for customer, optional contract, and task description."
+for customer, optional contract, and task description.
+
+When `kaisho-api-sync' is non-nil, the running state is verified
+against the Kaisho API at `kaisho-api-url' before deciding whether
+to stop or start.  Falls back to local org-clock state when the
+server is unreachable."
   (interactive)
-  (if (org-clocking-p)
+  (if (kaisho--clock-running-p)
       (condition-case _err
           (progn
-            (org-clock-out)
+            (when (org-clocking-p)
+              (org-clock-out))
             (message "Clock stopped"))
         (error
          (org-clock-cancel)
@@ -524,17 +589,6 @@ Intended for use inside org capture templates."
   "Run `kai sync' to sync Kaisho data."
   (interactive)
   (kaisho-run-command "sync"))
-
-(defun kaisho-serve ()
-  "Start the Kaisho backend with `kai serve'."
-  (interactive)
-  (let ((buf (get-buffer-create kaisho-clock-buffer-name)))
-    (with-current-buffer buf
-      (erase-buffer))
-    (start-process "kaisho-serve" buf
-                   kaisho-cli-executable "serve")
-    (pop-to-buffer buf)
-    (message "Kaisho server started")))
 
 
 ;;; ---------------------------------------------------------------
