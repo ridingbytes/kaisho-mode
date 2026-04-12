@@ -4,7 +4,7 @@
 
 ;; Author: Ramon Bartl <rb@ridingbytes.com>
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "27.1") (org "9.5"))
+;; Package-Requires: ((emacs "27.1") (org "9.5") (websocket "1.12"))
 ;; Keywords: tools, org, productivity, time-tracking
 ;; URL: https://github.com/ridingbytes/kaisho-mode
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -35,6 +35,8 @@
 
 (require 'org)
 (require 'json)
+(require 'url)
+(require 'websocket)
 
 
 ;;; ---------------------------------------------------------------
@@ -57,6 +59,27 @@ Used for org-mode integration: agenda files, refile targets,
 and capture templates.  Must match the org directory configured
 in the Kaisho app settings."
   :type 'directory
+  :group 'kaisho)
+
+(defcustom kaisho-backend-url "http://localhost:8765"
+  "Base URL of the kaisho backend, without trailing slash.
+The WebSocket URL is derived by replacing http with ws (or
+https with wss).  Adjust this to match the port configured in
+your kaisho profile."
+  :type 'string
+  :group 'kaisho)
+
+(defcustom kaisho-reconnect-delay 5
+  "Seconds to wait before reconnecting after a WebSocket disconnect."
+  :type 'integer
+  :group 'kaisho)
+
+(defcustom kaisho-mode-line-format " [* %d %h:%02m]"
+  "Format string for the active-clock mode-line indicator.
+%d is replaced with the clock description (falls back to
+customer), %h with elapsed hours, %02m with zero-padded elapsed
+minutes within the current hour."
+  :type 'string
   :group 'kaisho)
 
 
@@ -116,6 +139,143 @@ Cache entries expire after `kaisho-cache-ttl' seconds."
   (interactive)
   (clrhash kaisho--cache)
   (message "kaisho: cache cleared"))
+
+
+;;; ---------------------------------------------------------------
+;;; Live clock: WebSocket + REST
+;;; ---------------------------------------------------------------
+
+(defvar kaisho--ws nil
+  "Active `websocket' object, or nil when disconnected.")
+
+(defvar kaisho--active-clock nil
+  "Plist for the running clock as returned by /api/clocks/active,
+or nil when no clock is active.")
+
+(defvar kaisho--mode-line-string ""
+  "Mode-line segment updated by `kaisho--update-mode-line'.")
+
+(defvar kaisho--tick-timer nil
+  "Repeating timer that refreshes elapsed-time display every 60s.")
+
+(defvar kaisho--mode-line-spec '(:eval kaisho--mode-line-string)
+  "Mode-line spec added to `global-mode-string'.")
+
+(defun kaisho--ws-url ()
+  "Derive the WebSocket URL from `kaisho-backend-url'."
+  (replace-regexp-in-string
+   "^https" "wss"
+   (replace-regexp-in-string "^http" "ws" kaisho-backend-url)))
+
+(defun kaisho--elapsed-minutes (start-iso)
+  "Return elapsed minutes since START-ISO (ISO-8601 string)."
+  (let* ((start (date-to-time start-iso))
+         (elapsed (float-time (time-subtract (current-time) start))))
+    (floor (/ elapsed 60))))
+
+(defun kaisho--update-mode-line ()
+  "Recompute `kaisho--mode-line-string' from `kaisho--active-clock'."
+  (setq kaisho--mode-line-string
+        (if kaisho--active-clock
+            (let* ((desc (or (plist-get kaisho--active-clock :description)
+                             (plist-get kaisho--active-clock :customer)
+                             "?"))
+                   (start (plist-get kaisho--active-clock :start))
+                   (total (kaisho--elapsed-minutes start))
+                   (h (/ total 60))
+                   (m (% total 60)))
+              (format-spec kaisho-mode-line-format
+                           `((?d . ,desc) (?h . ,h) (?m . ,m))))
+          ""))
+  (force-mode-line-update t))
+
+(defun kaisho--set-clock (data)
+  "Record DATA as the active clock and start the tick timer."
+  (setq kaisho--active-clock data)
+  (kaisho--update-mode-line)
+  (unless kaisho--tick-timer
+    (setq kaisho--tick-timer
+          (run-with-timer 60 60 #'kaisho--update-mode-line))))
+
+(defun kaisho--clear-clock ()
+  "Clear the active clock and stop the tick timer."
+  (setq kaisho--active-clock nil)
+  (when kaisho--tick-timer
+    (cancel-timer kaisho--tick-timer)
+    (setq kaisho--tick-timer nil))
+  (kaisho--update-mode-line))
+
+(defun kaisho--fetch-active ()
+  "Fetch /api/clocks/active via REST and update clock state."
+  (url-retrieve
+   (concat kaisho-backend-url "/api/clocks/active")
+   (lambda (status)
+     (if (plist-get status :error)
+         (kaisho--clear-clock)
+       (goto-char (point-min))
+       (when (re-search-forward "^$" nil t)
+         (let* ((json-object-type 'plist)
+                (json-false nil)
+                (data (ignore-errors (json-read))))
+           (if (or (null data) (null (plist-get data :active)))
+               (kaisho--clear-clock)
+             (kaisho--set-clock data))))))
+   nil
+   :silent))
+
+(defun kaisho--on-message (_ws frame)
+  "Handle an incoming WebSocket FRAME."
+  (let* ((json-object-type 'plist)
+         (json-false nil)
+         (payload (ignore-errors
+                    (json-read-from-string
+                     (websocket-frame-text frame))))
+         (resource (and payload (plist-get payload :resource))))
+    (when (equal resource "clocks")
+      (kaisho--fetch-active))))
+
+(defun kaisho--on-close (_ws)
+  "Handle WebSocket disconnect; schedule a reconnect."
+  (setq kaisho--ws nil)
+  (when kaisho-mode
+    (run-with-timer kaisho-reconnect-delay nil #'kaisho--ws-connect)))
+
+(defun kaisho--ws-connect ()
+  "Open (or reopen) the WebSocket connection to kaisho."
+  (when (and kaisho--ws (websocket-openp kaisho--ws))
+    (websocket-close kaisho--ws))
+  (condition-case err
+      (progn
+        (setq kaisho--ws
+              (websocket-open
+               (concat (kaisho--ws-url) "/ws")
+               :on-message #'kaisho--on-message
+               :on-close   #'kaisho--on-close
+               :on-error   (lambda (_ws _type e)
+                             (message "kaisho: WS error: %s" e))))
+        (kaisho--fetch-active))
+    (error
+     (message "kaisho: cannot connect to %s (%s); retry in %ds"
+              kaisho-backend-url err kaisho-reconnect-delay)
+     (run-with-timer kaisho-reconnect-delay nil
+                     #'kaisho--ws-connect))))
+
+(defun kaisho--ws-disconnect ()
+  "Close the WebSocket connection and clear clock state."
+  (when kaisho--tick-timer
+    (cancel-timer kaisho--tick-timer)
+    (setq kaisho--tick-timer nil))
+  (when (and kaisho--ws (websocket-openp kaisho--ws))
+    (websocket-close kaisho--ws))
+  (setq kaisho--ws nil)
+  (kaisho--clear-clock))
+
+;;;###autoload
+(defun kaisho-reconnect ()
+  "Manually reconnect to the kaisho backend WebSocket."
+  (interactive)
+  (kaisho--ws-disconnect)
+  (kaisho--ws-connect))
 
 
 ;;; ---------------------------------------------------------------
@@ -187,9 +347,13 @@ Excludes contracts with billable=false or invoiced=true."
                    data)))))
 
 (defun kaisho--clock-active-p ()
-  "Return non-nil when a clock is active, querying the kai CLI."
-  (let ((data (kaisho--call-json-safe "clock" "status" "--json")))
-    (eq (alist-get 'active data) t)))
+  "Return non-nil when a clock is active.
+Uses the cached WebSocket state when connected; falls back to the
+kai CLI otherwise."
+  (if kaisho--ws
+      (not (null kaisho--active-clock))
+    (let ((data (kaisho--call-json-safe "clock" "status" "--json")))
+      (eq (alist-get 'active data) t))))
 
 
 ;;; ---------------------------------------------------------------
@@ -210,6 +374,7 @@ and task description, then run `kai clock start'."
   (if (kaisho--clock-active-p)
       (progn
         (kaisho--call "clock" "stop")
+        (kaisho--clear-clock)
         (message "Clock stopped"))
     (kaisho--clock-start-new)))
 
@@ -235,6 +400,11 @@ and task description, then run `kai clock start'."
         (when start-iso
           (kaisho--call-json-safe
            "clock" "update" start-iso "--contract" contract))))
+    (when result
+      (kaisho--set-clock
+       (list :customer customer
+             :description task
+             :start (alist-get 'started_at result))))
     (message "Clock started: [%s]%s %s"
              customer
              (if contract (format " (%s)" contract) "")
@@ -463,6 +633,8 @@ agenda views -- configure those in your init file."
     ;; CLI
     (define-key map (kbd "C-c k !") #'kaisho-run-command-interactive)
     (define-key map (kbd "C-c k X") #'kaisho-cache-clear)
+    ;; Backend
+    (define-key map (kbd "C-c k R") #'kaisho-reconnect)
     map)
   "Keymap for `kaisho-mode'.
 
@@ -476,7 +648,8 @@ Default bindings use C-c k as the prefix:
   f c kaisho-open-clocks
   f n kaisho-open-notes
   !   kaisho-run-command-interactive
-  X   kaisho-cache-clear")
+  X   kaisho-cache-clear
+  R   kaisho-reconnect")
 
 ;;;###autoload
 (define-minor-mode kaisho-mode
@@ -486,12 +659,24 @@ Provides clock management, task navigation and kai CLI access
 for the Kaisho local-first productivity app.  All data operations
 are delegated to the `kai' CLI; no org files are parsed directly.
 
+When enabled, connects to the kaisho backend at
+`kaisho-backend-url' via WebSocket and keeps an active-clock
+indicator in the mode line up to date in real time.  Use
+`kaisho-reconnect' (C-c k R) to reconnect manually.
+
 \\{kaisho-mode-map}"
   :init-value nil
   :lighter " Kaisho"
   :keymap kaisho-mode-map
   :global t
-  :group 'kaisho)
+  :group 'kaisho
+  (if kaisho-mode
+      (progn
+        (add-to-list 'global-mode-string kaisho--mode-line-spec t)
+        (kaisho--ws-connect))
+    (kaisho--ws-disconnect)
+    (setq global-mode-string
+          (delete kaisho--mode-line-spec global-mode-string))))
 
 (provide 'kaisho-mode)
 
