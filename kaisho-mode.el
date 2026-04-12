@@ -36,7 +36,6 @@
 (require 'org)
 (require 'json)
 (require 'url)
-(require 'websocket)
 
 
 ;;; ---------------------------------------------------------------
@@ -242,23 +241,28 @@ or nil when no clock is active.")
 
 (defun kaisho--ws-connect ()
   "Open (or reopen) the WebSocket connection to kaisho."
-  (when (and kaisho--ws (websocket-openp kaisho--ws))
-    (websocket-close kaisho--ws))
-  (condition-case err
-      (progn
-        (setq kaisho--ws
-              (websocket-open
-               (concat (kaisho--ws-url) "/ws")
-               :on-message #'kaisho--on-message
-               :on-close   #'kaisho--on-close
-               :on-error   (lambda (_ws _type e)
-                             (message "kaisho: WS error: %s" e))))
-        (kaisho--fetch-active))
-    (error
-     (message "kaisho: cannot connect to %s (%s); retry in %ds"
-              kaisho-backend-url err kaisho-reconnect-delay)
-     (run-with-timer kaisho-reconnect-delay nil
-                     #'kaisho--ws-connect))))
+  (if (not (require 'websocket nil t))
+      (message (concat "kaisho: websocket.el not found -- "
+                       "live clock updates disabled. "
+                       "Add (package! websocket) to packages.el "
+                       "and run doom sync."))
+    (when (and kaisho--ws (websocket-openp kaisho--ws))
+      (websocket-close kaisho--ws))
+    (condition-case err
+        (progn
+          (setq kaisho--ws
+                (websocket-open
+                 (concat (kaisho--ws-url) "/ws")
+                 :on-message #'kaisho--on-message
+                 :on-close   #'kaisho--on-close
+                 :on-error   (lambda (_ws _type e)
+                               (message "kaisho: WS error: %s" e))))
+          (kaisho--fetch-active))
+      (error
+       (message "kaisho: cannot connect to %s (%s); retry in %ds"
+                kaisho-backend-url err kaisho-reconnect-delay)
+       (run-with-timer kaisho-reconnect-delay nil
+                       #'kaisho--ws-connect)))))
 
 (defun kaisho--ws-disconnect ()
   "Close the WebSocket connection and clear clock state."
