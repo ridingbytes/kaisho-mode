@@ -86,6 +86,39 @@ in the Kaisho app settings."
 
 
 ;;; ---------------------------------------------------------------
+;;; Result cache
+;;; ---------------------------------------------------------------
+
+(defcustom kaisho-cache-ttl 60
+  "Seconds to cache kai CLI results.
+Set to 0 to disable caching."
+  :type 'integer
+  :group 'kaisho)
+
+(defvar kaisho--cache (make-hash-table :test 'equal)
+  "Cache table: key -> (timestamp . data).")
+
+(defun kaisho--cached-call-json (cache-key &rest args)
+  "Return cached result for CACHE-KEY, or call kai CLI with ARGS.
+Cache entries expire after `kaisho-cache-ttl' seconds."
+  (let* ((now   (float-time))
+         (entry (gethash cache-key kaisho--cache))
+         (ts    (car entry))
+         (data  (cdr entry)))
+    (if (and entry (< (- now ts) kaisho-cache-ttl))
+        data
+      (let ((result (apply #'kaisho--call-json-safe args)))
+        (puthash cache-key (cons now result) kaisho--cache)
+        result))))
+
+(defun kaisho-cache-clear ()
+  "Invalidate the kaisho CLI result cache."
+  (interactive)
+  (clrhash kaisho--cache)
+  (message "kaisho: cache cleared"))
+
+
+;;; ---------------------------------------------------------------
 ;;; CLI runner
 ;;; ---------------------------------------------------------------
 
@@ -125,13 +158,15 @@ JSON arrays become lists, objects become alists."
 
 (defun kaisho-customers ()
   "Return list of active customer name strings via kai CLI."
-  (let ((data (kaisho--call-json-safe "customer" "list" "--json")))
+  (let ((data (kaisho--cached-call-json
+               "customers" "customer" "list" "--json")))
     (mapcar (lambda (c) (alist-get 'name c)) data)))
 
 (defun kaisho-customer-contracts (customer)
   "Return available contract names for CUSTOMER via kai CLI.
 Excludes contracts with billable=false or invoiced=true."
-  (let ((data (kaisho--call-json-safe
+  (let ((data (kaisho--cached-call-json
+               (concat "contracts/" customer)
                "contract" "list" customer "--json")))
     (mapcar
      (lambda (c) (alist-get 'name c))
@@ -143,7 +178,8 @@ Excludes contracts with billable=false or invoiced=true."
 
 (defun kaisho-clock-tasks (customer)
   "Return recent task descriptions for CUSTOMER via kai CLI."
-  (let ((data (kaisho--call-json-safe
+  (let ((data (kaisho--cached-call-json
+               (concat "clock-tasks/" customer)
                "clock" "list" "--customer" customer "--json")))
     (delete-dups
      (delq nil
@@ -413,6 +449,7 @@ agenda views -- configure those in your init file."
     (define-key map (kbd "C-c k f n") #'kaisho-open-notes)
     ;; CLI
     (define-key map (kbd "C-c k !") #'kaisho-run-command-interactive)
+    (define-key map (kbd "C-c k X") #'kaisho-cache-clear)
     map)
   "Keymap for `kaisho-mode'.
 
@@ -425,7 +462,8 @@ Default bindings use C-c k as the prefix:
   f t kaisho-open-todos
   f c kaisho-open-clocks
   f n kaisho-open-notes
-  !   kaisho-run-command-interactive")
+  !   kaisho-run-command-interactive
+  X   kaisho-cache-clear")
 
 ;;;###autoload
 (define-minor-mode kaisho-mode
