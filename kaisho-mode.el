@@ -4,7 +4,7 @@
 
 ;; Author: Ramon Bartl <rb@ridingbytes.com>
 ;; Version: 0.2.0
-;; Package-Requires: ((emacs "27.1") (org "9.5") (websocket "1.12") (cl-lib "0.5"))
+;; Package-Requires: ((emacs "27.1") (org "9.5") (websocket "1.12"))
 ;; Keywords: tools, org, productivity, time-tracking
 ;; URL: https://github.com/ridingbytes/kaisho-mode
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -33,7 +33,6 @@
 
 ;;; Code:
 
-(require 'cl-lib)
 (require 'org)
 (require 'json)
 (require 'url)
@@ -422,13 +421,12 @@ Returns non-nil on success."
 
 (defun kaisho--clock-start-new ()
   "Prompt for customer, contract and task, then call kai clock start."
-  (when (and kaisho--last-clock
-             (y-or-n-p
-              (format "Resume [%s - %s]? "
-                      (or (plist-get kaisho--last-clock :customer) "")
-                      (or (plist-get kaisho--last-clock :description) ""))))
-    (kaisho--clock-resume)
-    (cl-return-from kaisho--clock-start-new))
+  (unless (and kaisho--last-clock
+               (y-or-n-p
+                (format "Resume [%s - %s]? "
+                        (or (plist-get kaisho--last-clock :customer) "")
+                        (or (plist-get kaisho--last-clock :description) "")))
+               (kaisho--clock-resume))
   (let* ((customer (completing-read
                     "Customer: " (kaisho-customers) nil nil))
          (customer (if (string-empty-p customer) "Misc" customer))
@@ -457,7 +455,7 @@ Returns non-nil on success."
     (message "Clock started: [%s]%s %s"
              customer
              (if contract (format " (%s)" contract) "")
-             task)))
+             task))))
 
 (defun kaisho-clock-today-summary ()
   "Show today's clocked time per customer in the minibuffer."
