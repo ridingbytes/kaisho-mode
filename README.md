@@ -3,27 +3,26 @@
 Emacs integration for the [Kaisho](https://github.com/ridingbytes/kaisho)
 local-first productivity platform.
 
-Kaisho manages tasks, customers, contracts and time tracking through
-org-mode files.  This package makes Emacs a first-class client for those
-files, using `org-clock` for time tracking rather than reimplementing it.
+This package is a thin Emacs client that delegates all data operations to
+the `kai` CLI.  No org files are parsed directly.
 
 ## Features
 
-- Clock in and out on customer/contract tasks via `org-clock`
-- Customer and contract completion pulled from `customers.org`
-- Manual backdated clock entry insertion
-- Today's clock summary in the minibuffer
-- Weekly clock report table (inserted into `clocks.org`)
-- Navigate to the current or last clocked task
-- Open Kaisho org files directly
-- Run `kai` CLI commands from Emacs
-- Optional API sync: detect clocks stopped from the web app
+- Clock in and out on customer/contract tasks via `kai clock start/stop`
+- Customer and contract completion via `kai customer list` / `kai contract list`
+- Recent task descriptions for completion via `kai clock list`
+- Manual backdated clock entry via `kai clock book` + `kai clock update`
+- Today's clock summary via `kai clock list`
+- Weekly clock report table (org clocktable over clocks.org)
+- Navigate to the clocks file
+- Open Kaisho org files for agenda and refile
+- Run any `kai` command from the minibuffer
 
 ## Requirements
 
 - Emacs 27.1 or later
 - Org-mode 9.5 or later
-- A Kaisho installation with org files (the `kai` server is optional)
+- The `kai` CLI (from a Kaisho installation)
 
 ## Installation
 
@@ -33,6 +32,8 @@ files, using `org-clock` for time tracking rather than reimplementing it.
 (use-package kaisho-mode
   :straight (:host github :repo "ridingbytes/kaisho-mode")
   :config
+  (setq kaisho-cli-executable
+        (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
   (setq kaisho-org-dir "~/ownCloud/cowork/org/")
   (kaisho-configure-org)
   (kaisho-mode +1))
@@ -44,14 +45,14 @@ files, using `org-clock` for time tracking rather than reimplementing it.
 (use-package kaisho-mode
   :elpaca (:host github :repo "ridingbytes/kaisho-mode")
   :config
+  (setq kaisho-cli-executable
+        (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
   (setq kaisho-org-dir "~/ownCloud/cowork/org/")
   (kaisho-configure-org)
   (kaisho-mode +1))
 ```
 
 ### Manual
-
-Clone this repository and add the directory to your `load-path`:
 
 ```elisp
 (add-to-list 'load-path "/path/to/kaisho-mode")
@@ -60,62 +61,44 @@ Clone this repository and add the directory to your `load-path`:
 
 ## Configuration
 
-### Directory
-
-Set `kaisho-org-dir` to the directory that contains your Kaisho org files.
-This must match the org directory configured in the Kaisho app settings.
-
-```elisp
-(setq kaisho-org-dir "~/ownCloud/cowork/org/")
-```
-
-The package derives all file paths from this variable at call time, so
-changing it takes effect without restarting Emacs.
-
-### Org-mode setup
-
-`kaisho-configure-org` sets the essential org-mode variables to point at
-Kaisho files.  Call it after setting `kaisho-org-dir`:
-
-```elisp
-(kaisho-configure-org)
-```
-
-This configures:
-- `org-directory` and `org-default-notes-file`
-- `org-agenda-files` (todos.org and clocks.org)
-- Clock persistence, `org-clock-into-drawer`, `org-clock-out-when-done`
-
-TODO keywords, capture templates and agenda views are intentionally left
-to your personal config.
-
 ### CLI executable
 
-If `kai` is not on your `exec-path`, set the full path.  When running
-Kaisho from a local checkout with a virtualenv, point directly to the
-executable inside `.venv`:
+Set `kaisho-cli-executable` to the full path of the `kai` binary.  When
+running Kaisho from a virtualenv, point directly to the venv executable:
 
 ```elisp
 (setq kaisho-cli-executable
       (expand-file-name "~/develop/kaisho/.venv/bin/kai"))
 ```
 
-### API sync (optional)
-
-By default kaisho-mode tracks clock state locally via `org-clock`.  If
-you also run the kai server and want `kaisho-clock-toggle` to detect
-clocks stopped from the web app, enable API sync:
+Or use a pyenv shim:
 
 ```elisp
-(setq kaisho-api-sync t)
-;; Default URL is http://localhost:8765 -- change if needed:
-;; (setq kaisho-api-url "http://localhost:8765")
+(setq kaisho-cli-executable
+      (expand-file-name "~/.pyenv/shims/kai"))
 ```
 
-When enabled, `kaisho-clock-toggle` queries `GET /api/clocks/active`
-before deciding whether to stop or start.  If the server is unreachable
-it falls back silently to local org-clock state, so toggling still works
-without the server running.
+### Org directory
+
+Set `kaisho-org-dir` to the directory containing your Kaisho org files.
+Used for org-mode integration (agenda files, refile targets, capture
+templates).  Must match the org directory configured in the Kaisho app.
+
+```elisp
+(setq kaisho-org-dir "~/ownCloud/cowork/org/")
+```
+
+### Org-mode setup
+
+`kaisho-configure-org` sets `org-directory`, `org-default-notes-file`
+and `org-agenda-files`.  Call it after setting `kaisho-org-dir`:
+
+```elisp
+(kaisho-configure-org)
+```
+
+TODO keywords, capture templates, refile targets and agenda views are
+intentionally left to your personal config.
 
 ## Default keybindings
 
@@ -126,10 +109,9 @@ under the `C-c k` prefix:
 |-------------|----------------------------------|--------------------------------|
 | `C-c k t`   | `kaisho-clock-toggle`            | Start or stop the clock        |
 | `C-c k s`   | `kaisho-clock-today-summary`     | Show today's clocked time      |
-| `C-c k g`   | `kaisho-clock-goto`              | Jump to current/last clock     |
+| `C-c k g`   | `kaisho-clock-goto`              | Open clocks.org, find open clock |
 | `C-c k i`   | `kaisho-insert-clock-entry`      | Insert a backdated clock entry |
 | `C-c k r`   | `kaisho-clock-report`            | Insert/update clock table      |
-| `C-c k x`   | `org-clock-cancel`               | Cancel the running clock       |
 | `C-c k f t` | `kaisho-open-todos`              | Open todos.org                 |
 | `C-c k f c` | `kaisho-open-clocks`             | Open clocks.org                |
 | `C-c k f n` | `kaisho-open-notes`              | Open notes.org                 |
@@ -137,14 +119,15 @@ under the `C-c k` prefix:
 
 ## Doom Emacs
 
-With Doom, bind commands under a `SPC n k` prefix instead:
+With Doom, bind commands under a `SPC n k` prefix:
 
 ```elisp
 (use-package! kaisho-mode
-  :straight (:host github :repo "ridingbytes/kaisho-mode")
+  :load-path "~/develop/kaisho-mode"
   :config
+  (setq kaisho-cli-executable
+        (expand-file-name "~/.pyenv/shims/kai"))
   (setq kaisho-org-dir "~/ownCloud/cowork/org/")
-  (setq kaisho-api-sync t)
   (kaisho-configure-org)
   (kaisho-mode +1))
 
@@ -160,14 +143,14 @@ With Doom, bind commands under a `SPC n k` prefix instead:
        :desc "Clock goto"     "g" #'kaisho-clock-goto
        :desc "Clock insert"   "i" #'kaisho-insert-clock-entry
        :desc "Clock report"   "r" #'kaisho-clock-report
-       :desc "Clock cancel"   "x" #'org-clock-cancel
        ;; CLI
        :desc "Run kai command" "!" #'kaisho-run-command-interactive))
 ```
 
 ## Org file format
 
-Kaisho organises clock entries in a flat heading structure:
+Kaisho organises clock entries in a flat heading structure written by
+the kai backend:
 
 ```org
 * [CUSTOMER]: task description

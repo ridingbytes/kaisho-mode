@@ -3,7 +3,7 @@
 ;; Copyright (C) 2026 Ramon Bartl
 
 ;; Author: Ramon Bartl <rb@ridingbytes.com>
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; Package-Requires: ((emacs "27.1") (org "9.5"))
 ;; Keywords: tools, org, productivity, time-tracking
 ;; URL: https://github.com/ridingbytes/kaisho-mode
@@ -14,27 +14,17 @@
 ;; kaisho-mode integrates Emacs with the Kaisho productivity app.
 ;;
 ;; Kaisho is a local-first productivity platform that manages tasks,
-;; customers, contracts and time tracking via org-mode files.  This
-;; package makes Emacs a first-class client for those files, using
-;; org-clock for time tracking rather than reimplementing it.
+;; customers, contracts and time tracking.  This package is a thin
+;; Emacs client that delegates all data operations to the `kai' CLI.
+;; No org file parsing is done here.
 ;;
-;; Features:
-;;   - Clock in/out on customer+contract tasks using org-clock
-;;   - Manual backdated clock entry insertion
-;;   - Clock summary for today, clock report table
-;;   - Customer and contract completion from customers.org
-;;   - Capture templates wired to Kaisho org files
-;;   - Run kai CLI commands from within Emacs
-;;   - Optional API sync: detect clocks stopped from the web app
-;;
-;; Quickstart (straight.el):
+;; The only required configuration is the path to the `kai' executable:
 ;;
 ;;   (use-package kaisho-mode
 ;;     :straight (:host github :repo "ridingbytes/kaisho-mode")
 ;;     :config
+;;     (setq kaisho-cli-executable "/path/to/.venv/bin/kai")
 ;;     (setq kaisho-org-dir "~/your/org/dir/")
-;;     ;; Optional: enable API sync when the kai server is running
-;;     ;; (setq kaisho-api-sync t)
 ;;     (kaisho-configure-org)
 ;;     (kaisho-mode +1))
 ;;
@@ -44,7 +34,7 @@
 ;;; Code:
 
 (require 'org)
-(require 'org-clock)
+(require 'json)
 
 
 ;;; ---------------------------------------------------------------
@@ -56,33 +46,17 @@
   :group 'org
   :prefix "kaisho-")
 
-(defcustom kaisho-org-dir (expand-file-name "~/org/")
-  "Directory containing all Kaisho org files.
-This must match the org directory configured in the Kaisho app."
-  :type 'directory
-  :group 'kaisho)
-
 (defcustom kaisho-cli-executable "kai"
   "Path or name of the kai CLI executable."
   :type 'string
   :group 'kaisho)
 
-(defcustom kaisho-clock-buffer-name "*Kaisho Clock*"
-  "Buffer name used for kai CLI output."
-  :type 'string
-  :group 'kaisho)
-
-(defcustom kaisho-api-url "http://localhost:8765"
-  "Base URL of the running Kaisho backend.
-Used only when `kaisho-api-sync' is non-nil."
-  :type 'string
-  :group 'kaisho)
-
-(defcustom kaisho-api-sync nil
-  "When non-nil, verify clock state against the Kaisho API on toggle.
-Requires the kai server to be running at `kaisho-api-url'.
-When the server is unreachable, falls back to local org-clock state."
-  :type 'boolean
+(defcustom kaisho-org-dir (expand-file-name "~/org/")
+  "Directory containing all Kaisho org files.
+Used for org-mode integration: agenda files, refile targets,
+and capture templates.  Must match the org directory configured
+in the Kaisho app settings."
+  :type 'directory
   :group 'kaisho)
 
 
@@ -112,387 +86,167 @@ When the server is unreachable, falls back to local org-clock state."
 
 
 ;;; ---------------------------------------------------------------
-;;; Data access: customers, contracts, tasks
+;;; CLI runner
+;;; ---------------------------------------------------------------
+
+(defun kaisho--call (&rest args)
+  "Run kai CLI with ARGS and return stdout as a string.
+Signals an error when the process exits non-zero."
+  (with-temp-buffer
+    (let ((exit-code (apply #'call-process
+                            kaisho-cli-executable nil t nil args)))
+      (unless (zerop exit-code)
+        (error "kai %s failed: %s"
+               (mapconcat #'identity args " ")
+               (string-trim (buffer-string))))
+      (string-trim (buffer-string)))))
+
+(defun kaisho--call-json (&rest args)
+  "Run kai CLI with ARGS, parse stdout as JSON and return it.
+JSON arrays become lists, objects become alists."
+  (let* ((json-array-type 'list)
+         (json-object-type 'alist)
+         (json-false nil)
+         (output (apply #'kaisho--call args)))
+    (json-read-from-string output)))
+
+(defun kaisho--call-json-safe (&rest args)
+  "Like `kaisho--call-json' but return nil on any error."
+  (condition-case err
+      (apply #'kaisho--call-json args)
+    (error
+     (message "kaisho: %s" (error-message-string err))
+     nil)))
+
+
+;;; ---------------------------------------------------------------
+;;; Data access via CLI
 ;;; ---------------------------------------------------------------
 
 (defun kaisho-customers ()
-  "Return unique customer names from customers.org and clocks.org."
-  (let (customers)
-    (when (file-exists-p (kaisho-customers-file))
-      (with-temp-buffer
-        (insert-file-contents (kaisho-customers-file))
-        (while (re-search-forward "^\\*\\* \\(.+\\)$" nil t)
-          (push (string-trim (match-string-no-properties 1))
-                customers))))
-    (when (file-exists-p (kaisho-clocks-file))
-      (with-temp-buffer
-        (insert-file-contents (kaisho-clocks-file))
-        (while (re-search-forward
-                "^\\* \\[\\([^]]+\\)\\]:" nil t)
-          (push (match-string-no-properties 1) customers))))
-    (delete-dups (nreverse customers))))
+  "Return list of active customer name strings via kai CLI."
+  (let ((data (kaisho--call-json-safe "customer" "list" "--json")))
+    (mapcar (lambda (c) (alist-get 'name c)) data)))
 
 (defun kaisho-customer-contracts (customer)
-  "Return available contract names for CUSTOMER from customers.org.
-Contracts with :BILLABLE: false or :INVOICED: true are excluded."
-  (when (file-exists-p (kaisho-customers-file))
-    (with-temp-buffer
-      (insert-file-contents (kaisho-customers-file))
-      (let (contracts
-            (cust-re (concat "^\\*\\* "
-                             (regexp-quote customer)
-                             "\\s-*$")))
-        (when (re-search-forward cust-re nil t)
-          (let ((section-end
-                 (save-excursion
-                   (if (re-search-forward
-                        "^\\*\\* " nil t)
-                       (point)
-                     (point-max)))))
-            (while (re-search-forward
-                    "^\\*\\*\\* CONTRACT \\(.+\\)$"
-                    section-end t)
-              (let* ((name (string-trim
-                            (match-string-no-properties 1)))
-                     (props-end
-                      (save-excursion
-                        (if (re-search-forward
-                             "^\\(:END:\\|\\*\\)"
-                             section-end t)
-                            (point)
-                          section-end))))
-                (unless (or
-                         (save-excursion
-                           (re-search-forward
-                            "^\\s-*:BILLABLE:\\s-*false"
-                            props-end t))
-                         (save-excursion
-                           (re-search-forward
-                            "^\\s-*:INVOICED:\\s-*true"
-                            props-end t)))
-                  (push name contracts))))))
-        (nreverse contracts)))))
+  "Return available contract names for CUSTOMER via kai CLI.
+Excludes contracts with billable=false or invoiced=true."
+  (let ((data (kaisho--call-json-safe
+               "contract" "list" customer "--json")))
+    (mapcar
+     (lambda (c) (alist-get 'name c))
+     (seq-filter
+      (lambda (c)
+        (and (not (eq (alist-get 'billable c) nil))
+             (not (eq (alist-get 'invoiced c) t))))
+      data))))
 
 (defun kaisho-clock-tasks (customer)
-  "Return distinct task descriptions for CUSTOMER from clocks.org."
-  (when (file-exists-p (kaisho-clocks-file))
-    (with-temp-buffer
-      (insert-file-contents (kaisho-clocks-file))
-      (let (tasks)
-        (while (re-search-forward
-                (concat "^\\* \\["
-                        (regexp-quote customer)
-                        "\\]:\\s-+\\(.+\\)$")
-                nil t)
-          (push (match-string-no-properties 1) tasks))
-        (delete-dups (nreverse tasks))))))
+  "Return recent task descriptions for CUSTOMER via kai CLI."
+  (let ((data (kaisho--call-json-safe
+               "clock" "list" "--customer" customer "--json")))
+    (delete-dups
+     (delq nil
+           (mapcar (lambda (e) (alist-get 'description e))
+                   data)))))
+
+(defun kaisho--clock-active-p ()
+  "Return non-nil when a clock is active, querying the kai CLI."
+  (let ((data (kaisho--call-json-safe "clock" "status" "--json")))
+    (eq (alist-get 'active data) t)))
 
 
 ;;; ---------------------------------------------------------------
-;;; Clock entry management (internal helpers)
+;;; Clock operations via CLI
 ;;; ---------------------------------------------------------------
 
-(defun kaisho--find-or-create-entry (customer task
-                                     &optional contract)
-  "Find or create a \"* [CUSTOMER]: task\" heading in clocks.org.
-When CONTRACT is non-nil, stores it in a :CONTRACT: property.
-Leaves point at the beginning of the heading."
-  (let ((title (format "[%s]: %s" customer task)))
-    (goto-char (point-min))
-    (unless (re-search-forward
-             (concat "^\\* " (regexp-quote title) "\\s-*$")
-             nil t)
-      (goto-char (point-min))
-      (if (re-search-forward "^\\*" nil t)
-          (beginning-of-line)
-        (goto-char (point-max)))
-      (if contract
-          (insert (format (concat "* %s\n"
-                                  "  :PROPERTIES:\n"
-                                  "  :CONTRACT: %s\n"
-                                  "  :END:\n")
-                          title contract))
-        (insert (format "* %s\n\n" title)))
-      (goto-char (point-min))
-      (re-search-forward
-       (concat "^\\* " (regexp-quote title))))
-    (beginning-of-line)))
-
-(defun kaisho--insert-clock-into-logbook (clock-line)
-  "Insert CLOCK-LINE into the :LOGBOOK: drawer at point.
-Creates the drawer when absent."
-  (let ((task-end
-         (save-excursion
-           (org-end-of-subtree t t) (point))))
-    (if (re-search-forward
-         "^\\([ \t]*\\):LOGBOOK:" task-end t)
-        (let ((indent (match-string 1)))
-          (re-search-forward "^[ \t]*:END:" task-end t)
-          (beginning-of-line)
-          (insert (format "%s%s\n" indent clock-line)))
-      (end-of-line)
-      (insert (format "\n   :LOGBOOK:\n   %s\n   :END:"
-                      clock-line)))))
-
-
-;;; ---------------------------------------------------------------
-;;; API sync helpers
-;;; ---------------------------------------------------------------
-
-(defun kaisho--api-active-clock ()
-  "Query the Kaisho API for the active clock.
-Returns t when a clock is running, nil when idle, and
-\\='unreachable when the server cannot be contacted."
-  (condition-case _err
-      (let* ((url (concat (string-trim-right kaisho-api-url "/")
-                          "/api/clocks/active"))
-             (url-request-method "GET")
-             (response-buf (url-retrieve-synchronously url t t 2)))
-        (if (null response-buf)
-            'unreachable
-          (with-current-buffer response-buf
-            (goto-char (point-min))
-            (re-search-forward "\r?\n\r?\n" nil t)
-            (let* ((body (buffer-substring (point) (point-max)))
-                   (data (json-read-from-string body))
-                   (active (cdr (assq 'active data))))
-              (kill-buffer response-buf)
-              (if active t nil)))))
-    (error 'unreachable)))
-
-(defun kaisho--clock-running-p ()
-  "Return non-nil when a clock is considered running.
-When `kaisho-api-sync' is non-nil, asks the Kaisho API.
-Falls back to `org-clocking-p' when the server is unreachable
-or `kaisho-api-sync' is nil."
-  (if kaisho-api-sync
-      (let ((result (kaisho--api-active-clock)))
-        (cond
-         ((eq result 'unreachable)
-          (message "Kaisho: server unreachable, \
-using local clock state")
-          (org-clocking-p))
-         (t result)))
-    (org-clocking-p)))
-
-
-;;; ---------------------------------------------------------------
-;;; Clock in/out
-;;; ---------------------------------------------------------------
-
-(defun kaisho--last-task ()
-  "Return the heading of the last clocked task, or nil."
-  (when org-clock-history
-    (let ((marker (car org-clock-history)))
-      (when (marker-buffer marker)
-        (org-with-point-at marker
-          (org-get-heading t t t t))))))
+(defun kaisho--fmt-h (hours)
+  "Format HOURS (float) as a human-readable string like 2h05m."
+  (let* ((total-mins (round (* hours 60)))
+         (h (/ total-mins 60))
+         (m (% total-mins 60)))
+    (format "%dh%02dm" h m)))
 
 (defun kaisho-clock-toggle ()
-  "Toggle the clock on a Kaisho task.
+  "Toggle the clock on a Kaisho task via the kai CLI.
 
-When a clock is running: stop it (cancel if the marker is stale).
-When no clock is running: offer to resume the last task or prompt
-for customer, optional contract, and task description.
-
-When `kaisho-api-sync' is non-nil, the running state is verified
-against the Kaisho API at `kaisho-api-url' before deciding whether
-to stop or start.  Falls back to local org-clock state when the
-server is unreachable."
+When a clock is active: run `kai clock stop'.
+When no clock is active: prompt for customer, optional contract
+and task description, then run `kai clock start'."
   (interactive)
-  (if (kaisho--clock-running-p)
-      (condition-case _err
-          (progn
-            (when (org-clocking-p)
-              (org-clock-out))
-            (message "Clock stopped"))
-        (error
-         (org-clock-cancel)
-         (message "Clock cancelled (invalid marker)")))
-    (let ((last (kaisho--last-task)))
-      (if (and last
-               (y-or-n-p (format "Resume \"%s\"? " last)))
-          (progn
-            (org-clock-in-last)
-            (message "Clock resumed: %s" last))
-        (kaisho--clock-start-new)))))
+  (if (kaisho--clock-active-p)
+      (progn
+        (kaisho--call "clock" "stop")
+        (message "Clock stopped"))
+    (kaisho--clock-start-new)))
 
 (defun kaisho--clock-start-new ()
-  "Prompt for customer, contract and task, then start the clock."
-  (let* ((file     (kaisho-clocks-file))
-         (customer (completing-read "Customer: "
-                                    (kaisho-customers)
-                                    nil nil))
-         (customer (if (string-empty-p customer)
-                       "Misc" customer))
+  "Prompt for customer, contract and task, then call kai clock start."
+  (let* ((customer (completing-read
+                    "Customer: " (kaisho-customers) nil nil))
+         (customer (if (string-empty-p customer) "Misc" customer))
          (contracts (kaisho-customer-contracts customer))
-         (contract (when contracts
-                     (completing-read
-                      (format "[%s] Contract: " customer)
-                      (cons "- none -" contracts)
-                      nil t)))
-         (contract (when (and contract
-                              (not (string= contract
-                                            "- none -")))
-                     contract))
-         (title (completing-read
-                 (format "[%s] Task: " customer)
-                 (kaisho-clock-tasks customer)
-                 nil nil)))
-    (with-current-buffer (find-file-noselect file)
-      (when (= (buffer-size) 0)
-        (insert "#+TITLE: Clocks\n"
-                "#+STARTUP: overview\n\n"))
-      (kaisho--find-or-create-entry
-       customer title contract)
-      (org-clock-in)
-      (save-buffer))
+         (contract
+          (when contracts
+            (let ((choice (completing-read
+                           (format "[%s] Contract: " customer)
+                           (cons "- none -" contracts) nil t)))
+              (unless (string= choice "- none -") choice))))
+         (task (completing-read
+                (format "[%s] Task: " customer)
+                (kaisho-clock-tasks customer) nil nil))
+         (result (kaisho--call-json-safe
+                  "clock" "start" customer task "--json")))
+    (when (and contract result)
+      (let ((start-iso (alist-get 'started_at result)))
+        (when start-iso
+          (kaisho--call-json-safe
+           "clock" "update" start-iso "--contract" contract))))
     (message "Clock started: [%s]%s %s"
              customer
              (if contract (format " (%s)" contract) "")
-             title)))
-
-
-;;; ---------------------------------------------------------------
-;;; Manual backdated clock entry
-;;; ---------------------------------------------------------------
-
-(defun kaisho--format-ts (date-str time-str)
-  "Build an org inactive timestamp from DATE-STR and TIME-STR.
-DATE-STR is YYYY-MM-DD, TIME-STR is HH:MM."
-  (let ((enc (encode-time
-              0
-              (string-to-number (substring time-str 3 5))
-              (string-to-number (substring time-str 0 2))
-              (string-to-number (substring date-str 8 10))
-              (string-to-number (substring date-str 5 7))
-              (string-to-number (substring date-str 0 4)))))
-    (format-time-string "[%Y-%m-%d %a %H:%M]" enc)))
-
-(defun kaisho--clock-duration (start end)
-  "Return HH:MM duration string between START and END (both HH:MM)."
-  (let* ((to-mins (lambda (t-str)
-                    (+ (* 60 (string-to-number
-                              (substring t-str 0 2)))
-                       (string-to-number
-                        (substring t-str 3 5)))))
-         (diff (- (funcall to-mins end)
-                  (funcall to-mins start))))
-    (format "%d:%02d" (/ diff 60) (% diff 60))))
-
-(defun kaisho-insert-clock-entry ()
-  "Insert a past clock entry into clocks.org.
-Prompts for customer, contract, task, date, start and end time."
-  (interactive)
-  (let* ((customer (completing-read "Customer: "
-                                    (kaisho-customers)
-                                    nil nil))
-         (customer (if (string-empty-p customer)
-                       "Misc" customer))
-         (contracts (kaisho-customer-contracts customer))
-         (contract (when contracts
-                     (completing-read
-                      (format "[%s] Contract: " customer)
-                      (cons "- none -" contracts)
-                      nil t)))
-         (contract (when (and contract
-                              (not (string= contract
-                                            "- none -")))
-                     contract))
-         (title (completing-read
-                 (format "[%s] Task: " customer)
-                 (kaisho-clock-tasks customer)
-                 nil nil))
-         (date-str (org-read-date nil nil nil "Date: "))
-         (start    (read-string "Start (HH:MM): "))
-         (end      (read-string "End   (HH:MM): "))
-         (ts-start (kaisho--format-ts date-str start))
-         (ts-end   (kaisho--format-ts date-str end))
-         (dur      (kaisho--clock-duration start end))
-         (clock    (format "CLOCK: %s--%s =>  %s"
-                           ts-start ts-end dur)))
-    (find-file (kaisho-clocks-file))
-    (when (= (buffer-size) 0)
-      (insert "#+TITLE: Clocks\n"
-              "#+STARTUP: overview\n\n"))
-    (kaisho--find-or-create-entry customer title contract)
-    (kaisho--insert-clock-into-logbook clock)
-    (save-buffer)
-    (message "Inserted: %s" clock)))
-
-
-;;; ---------------------------------------------------------------
-;;; Clock reporting
-;;; ---------------------------------------------------------------
-
-(defun kaisho--today-by-customer ()
-  "Return alist of (customer . minutes) for today's clock entries."
-  (let ((today (format-time-string "%Y-%m-%d"))
-        (result '())
-        (current-customer nil))
-    (with-current-buffer
-        (find-file-noselect (kaisho-clocks-file))
-      (save-excursion
-        (goto-char (point-min))
-        (while (not (eobp))
-          (cond
-           ((looking-at "^\\* \\[\\([^]]+\\)\\]:")
-            (setq current-customer
-                  (match-string-no-properties 1)))
-           ((and current-customer
-                 (looking-at
-                  (concat "[ \t]*CLOCK: \\["
-                          (regexp-quote today)
-                          " [A-Za-z]+ [0-9:]+\\]"
-                          "--\\[[^]]+\\]"
-                          " =>\\s-+\\([0-9]+\\)"
-                          ":\\([0-9]+\\)")))
-            (let* ((mins (+ (* 60 (string-to-number
-                                   (match-string 1)))
-                            (string-to-number
-                             (match-string 2))))
-                   (entry (assoc current-customer result)))
-              (if entry
-                  (setcdr entry (+ (cdr entry) mins))
-                (push (cons current-customer mins)
-                      result)))))
-          (forward-line 1))))
-    (nreverse result)))
+             task)))
 
 (defun kaisho-clock-today-summary ()
   "Show today's clocked time per customer in the minibuffer."
   (interactive)
-  (let* ((data  (kaisho--today-by-customer))
-         (total (apply #'+ (mapcar #'cdr data))))
-    (if (null data)
+  (let* ((today (format-time-string "%Y-%m-%d"))
+         (entries (kaisho--call-json-safe
+                   "clock" "list"
+                   "--from" today "--to" today "--json"))
+         (totals (make-hash-table :test 'equal))
+         (total-h 0.0))
+    (dolist (e (or entries '()))
+      (let* ((cust (or (alist-get 'customer e) "?"))
+             (h (or (alist-get 'hours e) 0.0)))
+        (puthash cust (+ (gethash cust totals 0.0) h) totals)))
+    (if (hash-table-empty-p totals)
         (message "No time clocked today")
-      (message "Today: %dh%02dm  |  %s"
-               (/ total 60) (% total 60)
-               (mapconcat
-                (lambda (entry)
-                  (format "%s %dh%02dm"
-                          (car entry)
-                          (/ (cdr entry) 60)
-                          (% (cdr entry) 60)))
-                data "  ")))))
+      (maphash (lambda (_ h) (setq total-h (+ total-h h))) totals)
+      (let (pairs)
+        (maphash (lambda (k v) (push (cons k v) pairs)) totals)
+        (message "Today: %s  |  %s"
+                 (kaisho--fmt-h total-h)
+                 (mapconcat
+                  (lambda (p)
+                    (format "%s %s" (car p)
+                            (kaisho--fmt-h (cdr p))))
+                  (nreverse pairs) "  "))))))
 
 (defun kaisho-clock-goto ()
-  "Jump to the currently or most recently clocked task.
-Falls back to opening clocks.org when no history is available."
+  "Open clocks.org and move to the most recent open clock entry."
   (interactive)
-  (cond
-   ((org-clocking-p) (org-clock-goto))
-   ((and org-clock-history
-         (marker-buffer (car org-clock-history)))
-    (org-clock-goto))
-   (t
-    (find-file (kaisho-clocks-file))
-    (message "Opened clocks file (no recent clock)"))))
+  (find-file (kaisho-clocks-file))
+  (goto-char (point-min))
+  (if (re-search-forward "CLOCK: \\[[^]]+\\]$" nil t)
+      (beginning-of-line)
+    (message "No open clock entry found")))
 
 (defun kaisho-clock-report ()
   "Open clocks.org and update or insert a weekly clock table."
   (interactive)
   (find-file (kaisho-clocks-file))
+  (revert-buffer t t t)
   (goto-char (point-min))
   (if (re-search-forward "^#\\+BEGIN: clocktable" nil t)
       (progn
@@ -508,6 +262,86 @@ Falls back to opening clocks.org when no history is available."
       (forward-line -2)
       (org-ctrl-c-ctrl-c)
       (message "Clock table inserted"))))
+
+
+;;; ---------------------------------------------------------------
+;;; Manual backdated clock entry via CLI
+;;; ---------------------------------------------------------------
+
+(defun kaisho-insert-clock-entry ()
+  "Insert a backdated clock entry via kai clock book + update.
+Prompts for customer, contract, task, date, start and end time."
+  (interactive)
+  (let* ((customer (completing-read
+                    "Customer: " (kaisho-customers) nil nil))
+         (customer (if (string-empty-p customer) "Misc" customer))
+         (contracts (kaisho-customer-contracts customer))
+         (contract
+          (when contracts
+            (let ((choice (completing-read
+                           (format "[%s] Contract: " customer)
+                           (cons "- none -" contracts) nil t)))
+              (unless (string= choice "- none -") choice))))
+         (task (completing-read
+                (format "[%s] Task: " customer)
+                (kaisho-clock-tasks customer) nil nil))
+         (date-str (org-read-date nil nil nil "Date: "))
+         (start-str (read-string "Start (HH:MM): "))
+         (end-str   (read-string "End   (HH:MM): "))
+         (dur-mins  (- (kaisho--hhmm-to-mins end-str)
+                       (kaisho--hhmm-to-mins start-str)))
+         (dur-str   (format "%dmin" dur-mins))
+         (result    (kaisho--call-json-safe
+                     "clock" "book" dur-str customer task "--json")))
+    (when result
+      (let* ((start-iso (alist-get 'started_at result))
+             (hours     (/ dur-mins 60.0))
+             (update-args
+              (append (list "clock" "update" start-iso
+                            "--date" date-str
+                            "--hours" (number-to-string hours))
+                      (when contract
+                        (list "--contract" contract)))))
+        (apply #'kaisho--call update-args))
+      (message "Booked %s for [%s]%s: %s"
+               dur-str customer
+               (if contract (format " (%s)" contract) "")
+               task))))
+
+(defun kaisho--hhmm-to-mins (hhmm)
+  "Convert HH:MM string to total minutes."
+  (+ (* 60 (string-to-number (substring hhmm 0 2)))
+     (string-to-number (substring hhmm 3 5))))
+
+
+;;; ---------------------------------------------------------------
+;;; Project / capture helpers via CLI
+;;; ---------------------------------------------------------------
+
+(defun kaisho-capture-select-project ()
+  "Prompt for a customer name; return it as a [Customer] tag string.
+Reads customer list from the kai CLI.  Intended for use inside
+org capture templates."
+  (let* ((customers (kaisho-customers))
+         (raw (completing-read "Project: " customers nil nil)))
+    (if (string-match-p "^\\[.*\\]$" raw)
+        raw
+      (format "[%s]" raw))))
+
+(defun kaisho-change-project-tag ()
+  "Replace the [Customer] prefix on the org heading at point.
+Customer list is read from the kai CLI."
+  (interactive)
+  (save-excursion
+    (org-back-to-heading t)
+    (let ((new   (kaisho-capture-select-project))
+          (bound (line-end-position)))
+      (if (re-search-forward "\\(\\[[^]]+\\]\\)" bound t)
+          (replace-match new)
+        (when (re-search-forward
+               "^\\*+\\s-+\\(?:\\w+-?\\w*\\)\\s-+"
+               bound t)
+          (insert (concat new " ")))))))
 
 
 ;;; ---------------------------------------------------------------
@@ -531,64 +365,17 @@ Falls back to opening clocks.org when no history is available."
 
 
 ;;; ---------------------------------------------------------------
-;;; Project tag helpers (for capture templates)
-;;; ---------------------------------------------------------------
-
-(defun kaisho--todos-project-tags ()
-  "Return unique [CUSTOMER] prefixes found in todos.org."
-  (when (file-exists-p (kaisho-todos-file))
-    (with-temp-buffer
-      (insert-file-contents (kaisho-todos-file))
-      (let (tags)
-        (while (re-search-forward
-                "^\\* [A-Z-]+ \\(\\[[^]]+\\]\\):"
-                nil t)
-          (push (match-string-no-properties 1) tags))
-        (delete-dups (nreverse tags))))))
-
-(defun kaisho-capture-select-project ()
-  "Prompt for a [Project] tag; wraps bare names in brackets.
-Intended for use inside org capture templates."
-  (let* ((tags (kaisho--todos-project-tags))
-         (raw  (completing-read "Project: " tags nil nil)))
-    (if (string-match-p "^\\[.*\\]$" raw)
-        raw
-      (format "[%s]" raw))))
-
-(defun kaisho-change-project-tag ()
-  "Replace the [Project] prefix on the org heading at point."
-  (interactive)
-  (save-excursion
-    (org-back-to-heading t)
-    (let ((new   (kaisho-capture-select-project))
-          (bound (line-end-position)))
-      (if (re-search-forward "\\(\\[[^]]+\\]\\)" bound t)
-          (replace-match new)
-        (when (re-search-forward
-               "^\\*+\\s-+\\(?:\\w+-?\\w*\\)\\s-+"
-               bound t)
-          (insert (concat new " ")))))))
-
-
-;;; ---------------------------------------------------------------
-;;; kai CLI integration
+;;; kai CLI runner (interactive)
 ;;; ---------------------------------------------------------------
 
 (defun kaisho-run-command (args)
   "Run the kai CLI with ARGS (a string) in a compilation buffer."
-  (let ((cmd (concat kaisho-cli-executable " " args)))
-    (compile cmd)))
+  (compile (concat kaisho-cli-executable " " args)))
 
 (defun kaisho-run-command-interactive ()
   "Prompt for kai CLI arguments and run the command."
   (interactive)
-  (let ((args (read-string "kai args: ")))
-    (kaisho-run-command args)))
-
-(defun kaisho-sync ()
-  "Run `kai sync' to sync Kaisho data."
-  (interactive)
-  (kaisho-run-command "sync"))
+  (kaisho-run-command (read-string "kai args: ")))
 
 
 ;;; ---------------------------------------------------------------
@@ -599,23 +386,13 @@ Intended for use inside org capture templates."
   "Configure org-mode to use Kaisho files.
 
 Call this after setting `kaisho-org-dir'.  Sets org-directory,
-default-notes-file, agenda files, clocking persistence and
-clock-into-drawer.  Does not touch TODO keywords, capture
-templates or agenda views -- configure those in your init file."
-  (setq org-directory              kaisho-org-dir
-        org-default-notes-file     (kaisho-notes-file))
+default-notes-file, agenda files, refile targets and archive
+location.  Does not touch TODO keywords, capture templates or
+agenda views -- configure those in your init file."
+  (setq org-directory          kaisho-org-dir
+        org-default-notes-file (kaisho-notes-file))
   (setq org-agenda-files
-        (list (kaisho-todos-file) (kaisho-clocks-file)))
-  (setq org-clock-persist               'history
-        org-clock-persist-query-resume  t
-        org-clock-mode-line-total       'current
-        org-clock-idle-time             nil
-        org-clock-auto-clock-resolution 'when-no-clock-is-running
-        org-log-note-clock-out          nil
-        org-clock-into-drawer           t
-        org-clock-history-length        25
-        org-clock-out-when-done         t)
-  (org-clock-persistence-insinuate))
+        (list (kaisho-todos-file) (kaisho-clocks-file))))
 
 
 ;;; ---------------------------------------------------------------
@@ -630,7 +407,6 @@ templates or agenda views -- configure those in your init file."
     (define-key map (kbd "C-c k g") #'kaisho-clock-goto)
     (define-key map (kbd "C-c k i") #'kaisho-insert-clock-entry)
     (define-key map (kbd "C-c k r") #'kaisho-clock-report)
-    (define-key map (kbd "C-c k x") #'org-clock-cancel)
     ;; Files
     (define-key map (kbd "C-c k f t") #'kaisho-open-todos)
     (define-key map (kbd "C-c k f c") #'kaisho-open-clocks)
@@ -646,7 +422,6 @@ Default bindings use C-c k as the prefix:
   g   kaisho-clock-goto
   i   kaisho-insert-clock-entry
   r   kaisho-clock-report
-  x   org-clock-cancel
   f t kaisho-open-todos
   f c kaisho-open-clocks
   f n kaisho-open-notes
@@ -657,8 +432,8 @@ Default bindings use C-c k as the prefix:
   "Minor mode for Kaisho productivity integration.
 
 Provides clock management, task navigation and kai CLI access
-for the Kaisho local-first productivity app, operating on the
-same org files as the Kaisho backend.
+for the Kaisho local-first productivity app.  All data operations
+are delegated to the `kai' CLI; no org files are parsed directly.
 
 \\{kaisho-mode-map}"
   :init-value nil
