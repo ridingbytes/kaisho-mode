@@ -124,10 +124,13 @@ Cache entries expire after `kaisho-cache-ttl' seconds."
 
 (defun kaisho--call (&rest args)
   "Run kai CLI with ARGS and return stdout as a string.
+Uses the login shell so pyenv and PATH are initialised correctly.
 Signals an error when the process exits non-zero."
   (with-temp-buffer
-    (let ((exit-code (apply #'call-process
-                            kaisho-cli-executable nil t nil args)))
+    (let* ((cmd (mapconcat #'shell-quote-argument
+                           (cons kaisho-cli-executable args) " "))
+           (shell (or (getenv "SHELL") "/bin/bash"))
+           (exit-code (call-process shell nil t nil "-l" "-c" cmd)))
       (unless (zerop exit-code)
         (error "kai %s failed: %s"
                (mapconcat #'identity args " ")
