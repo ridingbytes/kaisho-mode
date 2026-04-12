@@ -73,12 +73,17 @@ your kaisho profile."
   :type 'integer
   :group 'kaisho)
 
-(defcustom kaisho-mode-line-format " [* %d %h:%02m]"
+(defcustom kaisho-mode-line-format " [⏱ %d %h:%02m]"
   "Format string for the active-clock mode-line indicator.
 %d is replaced with the clock description (falls back to
 customer), %h with elapsed hours, %02m with zero-padded elapsed
 minutes within the current hour."
   :type 'string
+  :group 'kaisho)
+
+(defface kaisho-mode-line-clock
+  '((t :foreground "#e5a50a" :weight bold))
+  "Face for the kaisho active-clock mode-line indicator."
   :group 'kaisho)
 
 
@@ -183,8 +188,10 @@ or nil when no clock is active.")
                    (total (kaisho--elapsed-minutes start))
                    (h (/ total 60))
                    (m (% total 60)))
-              (format-spec kaisho-mode-line-format
-                           `((?d . ,desc) (?h . ,h) (?m . ,m))))
+              (propertize
+               (format-spec kaisho-mode-line-format
+                            `((?d . ,desc) (?h . ,h) (?m . ,m)))
+               'face 'kaisho-mode-line-clock))
           ""))
   (force-mode-line-update t))
 
