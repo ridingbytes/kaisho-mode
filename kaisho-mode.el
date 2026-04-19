@@ -368,7 +368,7 @@ kai CLI otherwise."
   (if kaisho--ws
       (not (null kaisho--active-clock))
     (let ((data (kaisho--call-json-safe "clock" "status" "--json")))
-      (eq (alist-get 'active data) t))))
+      (and data (not (eq data :json-null))))))
 
 
 ;;; ---------------------------------------------------------------
@@ -442,20 +442,22 @@ Returns non-nil on success."
                 (kaisho-clock-tasks customer) nil nil))
          (result (kaisho--call-json-safe
                   "clock" "start" customer task "--json")))
-    (when (and contract result)
-      (let ((start-iso (alist-get 'start result)))
-        (when start-iso
-          (kaisho--call-json-safe
-           "clock" "update" start-iso "--contract" contract))))
     (when result
+      (when contract
+        (let ((start-iso (alist-get 'start result)))
+          (when start-iso
+            (kaisho--call-json-safe
+             "clock" "update" start-iso
+             "--contract" contract))))
       (kaisho--set-clock
        (list :customer customer
              :description task
-             :start (alist-get 'start result))))
-    (message "Clock started: [%s]%s %s"
-             customer
-             (if contract (format " (%s)" contract) "")
-             task))))
+             :start (alist-get 'start result)))
+      (message "Clock started: [%s]%s %s"
+               customer
+               (if contract
+                   (format " (%s)" contract) "")
+               task)))))
 
 (defun kaisho-clock-today-summary ()
   "Show today's clocked time per customer in the minibuffer."
@@ -545,7 +547,7 @@ Prompts for customer, contract, task, date, start and end time."
          (result    (kaisho--call-json-safe
                      "clock" "book" dur-str customer task "--json")))
     (when result
-      (let* ((start-iso (alist-get 'started_at result))
+      (let* ((start-iso (alist-get 'start result))
              (hours     (/ dur-mins 60.0))
              (update-args
               (append (list "clock" "update" start-iso
