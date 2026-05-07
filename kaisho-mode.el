@@ -37,6 +37,18 @@
 (require 'json)
 (require 'url)
 
+;; Forward declarations: `websocket' is loaded lazily in
+;; `kaisho--ws-connect' so byte-compilation does not require
+;; the package to be present.
+(declare-function websocket-open       "websocket")
+(declare-function websocket-close      "websocket")
+(declare-function websocket-openp      "websocket")
+(declare-function websocket-frame-text "websocket")
+
+;; `kaisho-mode' is defined by `define-minor-mode' below; declare it
+;; here so functions referencing the variable byte-compile cleanly.
+(defvar kaisho-mode)
+
 
 ;;; ---------------------------------------------------------------
 ;;; Customization
@@ -69,9 +81,29 @@ your kaisho profile."
   :group 'kaisho)
 
 (defcustom kaisho-reconnect-delay 5
-  "Seconds to wait before reconnecting after a WebSocket disconnect."
+  "Initial seconds to wait before reconnecting after a disconnect.
+While the backend stays unreachable the actual delay grows up to
+`kaisho-reconnect-max-delay' (exponential backoff), so an Emacs
+session running without Kaisho does not spam *Messages*."
   :type 'integer
   :group 'kaisho)
+
+(defcustom kaisho-reconnect-max-delay 300
+  "Upper bound for the reconnect backoff, in seconds.
+Once the backend is reachable again the delay is reset to
+`kaisho-reconnect-delay'."
+  :type 'integer
+  :group 'kaisho)
+
+(defvar kaisho--reconnect-current-delay nil
+  "Current backoff delay, in seconds.
+Reset to `kaisho-reconnect-delay' on a successful connect; doubled
+\(up to `kaisho-reconnect-max-delay') on each failure.")
+
+(defvar kaisho--reconnect-warned nil
+  "Non-nil after the first reachability failure has been logged.
+Subsequent failures stay silent so the user is not spammed when
+running Emacs without Kaisho.")
 
 (defcustom kaisho-mode-line-format " [⏱ %d %h:%02m]"
   "Format string for the active-clock mode-line indicator.
@@ -215,6 +247,21 @@ Saved on stop so the user can resume it on the next toggle.")
     (setq kaisho--tick-timer nil))
   (kaisho--update-mode-line))
 
+(defun kaisho--read-json-body ()
+  "Return parsed JSON from the body of the current url-retrieve buffer.
+Skips HTTP headers and decodes the body as UTF-8 before parsing,
+so non-ASCII characters (em-dash, accents, emoji) survive as
+proper multibyte strings."
+  (goto-char (point-min))
+  (when (re-search-forward "^\r?$" nil t)
+    (forward-char 1)
+    (let* ((body    (buffer-substring-no-properties
+                     (point) (point-max)))
+           (decoded (decode-coding-string body 'utf-8))
+           (json-object-type 'plist)
+           (json-false       nil))
+      (ignore-errors (json-read-from-string decoded)))))
+
 (defun kaisho--fetch-active ()
   "Fetch /api/clocks/active via REST and update clock state."
   (url-retrieve
@@ -222,14 +269,10 @@ Saved on stop so the user can resume it on the next toggle.")
    (lambda (status)
      (if (plist-get status :error)
          (kaisho--clear-clock)
-       (goto-char (point-min))
-       (when (re-search-forward "^$" nil t)
-         (let* ((json-object-type 'plist)
-                (json-false nil)
-                (data (ignore-errors (json-read))))
-           (if (or (null data) (null (plist-get data :active)))
-               (kaisho--clear-clock)
-             (kaisho--set-clock data))))))
+       (let ((data (kaisho--read-json-body)))
+         (if (or (null data) (null (plist-get data :active)))
+             (kaisho--clear-clock)
+           (kaisho--set-clock data)))))
    nil
    :silent))
 
@@ -250,13 +293,29 @@ Saved on stop so the user can resume it on the next toggle.")
   (when kaisho-mode
     (run-with-timer kaisho-reconnect-delay nil #'kaisho--ws-connect)))
 
+(defun kaisho--bump-reconnect-delay ()
+  "Double the current reconnect delay, capped at the configured max."
+  (setq kaisho--reconnect-current-delay
+        (min kaisho-reconnect-max-delay
+             (* 2 (or kaisho--reconnect-current-delay
+                      kaisho-reconnect-delay)))))
+
+(defun kaisho--reset-reconnect-delay ()
+  "Reset the reconnect backoff after a successful connect."
+  (setq kaisho--reconnect-current-delay kaisho-reconnect-delay
+        kaisho--reconnect-warned nil))
+
 (defun kaisho--ws-connect ()
-  "Open (or reopen) the WebSocket connection to kaisho."
+  "Open (or reopen) the WebSocket connection to kaisho.
+Failures are logged once (not on every retry) and use exponential
+backoff so an Emacs session running without Kaisho stays quiet."
   (if (not (require 'websocket nil t))
       (message (concat "kaisho: websocket.el not found -- "
                        "live clock updates disabled. "
                        "Add (package! websocket) to packages.el "
                        "and run doom sync."))
+    (unless kaisho--reconnect-current-delay
+      (setq kaisho--reconnect-current-delay kaisho-reconnect-delay))
     (when (and kaisho--ws (websocket-openp kaisho--ws))
       (websocket-close kaisho--ws))
     (condition-case err
@@ -268,12 +327,20 @@ Saved on stop so the user can resume it on the next toggle.")
                  :on-close   #'kaisho--on-close
                  :on-error   (lambda (_ws _type e)
                                (message "kaisho: WS error: %s" e))))
+          (kaisho--reset-reconnect-delay)
           (kaisho--fetch-active))
       (error
-       (message "kaisho: cannot connect to %s (%s); retry in %ds"
-                kaisho-backend-url err kaisho-reconnect-delay)
-       (run-with-timer kaisho-reconnect-delay nil
-                       #'kaisho--ws-connect)))))
+       (ignore err)
+       (unless kaisho--reconnect-warned
+         (message
+          (concat "kaisho: cannot reach %s -- backend offline? "
+                  "Retrying quietly in the background "
+                  "(M-x kaisho-reconnect to retry now).")
+          kaisho-backend-url)
+         (setq kaisho--reconnect-warned t))
+       (let ((delay kaisho--reconnect-current-delay))
+         (kaisho--bump-reconnect-delay)
+         (run-with-timer delay nil #'kaisho--ws-connect))))))
 
 (defun kaisho--ws-disconnect ()
   "Close the WebSocket connection and clear clock state."
@@ -287,8 +354,11 @@ Saved on stop so the user can resume it on the next toggle.")
 
 ;;;###autoload
 (defun kaisho-reconnect ()
-  "Manually reconnect to the kaisho backend WebSocket."
+  "Manually reconnect to the kaisho backend WebSocket.
+Resets the reconnect backoff so the next failure (if any) is
+reported again."
   (interactive)
+  (kaisho--reset-reconnect-delay)
   (kaisho--ws-disconnect)
   (kaisho--ws-connect))
 
@@ -299,10 +369,15 @@ Saved on stop so the user can resume it on the next toggle.")
 
 (defun kaisho--call (&rest args)
   "Run kai CLI with ARGS and return stdout as a string.
-Signals an error when the process exits non-zero."
+Signals an error when the process exits non-zero.
+Subprocess output is decoded as UTF-8 so non-ASCII characters
+(em-dash, accents, emoji) come back as proper multibyte strings
+instead of raw bytes."
   (with-temp-buffer
-    (let ((exit-code (apply #'call-process
-                            kaisho-cli-executable nil t nil args)))
+    (let* ((coding-system-for-read  'utf-8)
+           (coding-system-for-write 'utf-8)
+           (exit-code (apply #'call-process
+                             kaisho-cli-executable nil t nil args)))
       (unless (zerop exit-code)
         (error "kai %s failed: %s"
                (mapconcat #'identity args " ")
@@ -631,7 +706,8 @@ Runs `kai customer list --json' and displays the raw result."
       (insert (format "kaisho-cli-executable: %s\n" kaisho-cli-executable))
       (insert (format "kaisho-org-dir: %s\n\n" kaisho-org-dir))
       (insert "--- kai customer list --json ---\n")
-      (let* ((exit-code (call-process kaisho-cli-executable nil t nil
+      (let* ((coding-system-for-read 'utf-8)
+             (exit-code (call-process kaisho-cli-executable nil t nil
                                       "customer" "list" "--json")))
         (insert (format "\n--- exit code: %d ---\n" exit-code))))
     (pop-to-buffer buf)))
